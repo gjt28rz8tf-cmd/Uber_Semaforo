@@ -11,9 +11,9 @@
 <body style="margin:0;background:#080810">
 <div id="root"></div>
 <script type="text/babel">
-const PRECIO_NAFTA = 2100;
-const CONSUMO_L100KM = 10.5;
-const COMISION_UBER = 0.15;
+const PRECIO_NAFTA = 2050;
+const CONSUMO_L100KM = 9.5;
+const COMISION_UBER = 0.25;
 const UMBRAL_VERDE = 180;
 const UMBRAL_AMARILLO = 130;
 
@@ -44,19 +44,24 @@ function App() {
       r.readAsDataURL(file);
     });
     const mediaType = file.type || "image/jpeg";
+    const costoKm = (PRECIO_NAFTA * CONSUMO_L100KM) / 100;
     try {
       const res = await fetch("/api/analyze", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
-          model:"claude-sonnet-4-20250514", max_tokens:500,
+          model:"claude-haiku-4-5-20251001", max_tokens:300,
           messages:[{ role:"user", content:[
             { type:"image", source:{ type:"base64", media_type:mediaType, data:base64 }},
-            { type:"text", text:`Analizá esta captura de Uber Driver Argentina. Extraé los datos del viaje ofrecido.
-Buscá: precio (número grande tipo ARS4,262), distancia del viaje en "Viaje: X min (Y km)", tiempo del viaje, origen y destino.
-Ignorá números del mapa. Solo el precio grande del viaje.
+            { type:"text", text:`Analizá esta captura de Uber Driver Argentina.
+Extraé: precio ARS (número grande), distanciaKm, tiempoMin, origen, destino.
+Calculá internamente:
+- costoNafta = distanciaKm * ${costoKm.toFixed(2)}
+- neto = precio * ${(1 - COMISION_UBER).toFixed(2)} - costoNafta
+- arsPorMin = neto / tiempoMin
+- semaforo: "verde" si arsPorMin >= ${UMBRAL_VERDE}, "amarillo" si >= ${UMBRAL_AMARILLO}, sino "rojo"
 Respondé SOLO JSON sin markdown:
-{"precio":4262,"distanciaKm":5.8,"tiempoMin":19,"origen":"barrio origen","destino":"barrio destino","encontrado":true}
-Si no hay oferta visible: {"encontrado":false}` }
+{"encontrado":true,"precio":4262,"distanciaKm":5.8,"tiempoMin":19,"origen":"barrio","destino":"barrio","neto":2800,"costoNafta":1270,"arsPorMin":147,"semaforo":"amarillo"}
+Si no hay oferta: {"encontrado":false}` }
           ]}]
         })
       });
@@ -64,29 +69,15 @@ Si no hay oferta visible: {"encontrado":false}` }
       const raw = data.content?.map(b=>b.text||"").join("") || "";
       const parsed = JSON.parse(raw.replace(/```json|```/g,"").trim());
       if (!parsed.encontrado) { setError("No se detectó ninguna oferta de viaje."); setLoading(false); return; }
-      const costoKm = (PRECIO_NAFTA * CONSUMO_L100KM) / 100;
-      const costoViaje = parsed.distanciaKm * costoKm;
-      const neto = parsed.precio * (1 - COMISION_UBER) - costoViaje;
       const xKm = parsed.distanciaKm > 0 ? parsed.precio / parsed.distanciaKm : 0;
-      const xMin = parsed.tiempoMin > 0 ? neto / parsed.tiempoMin : 0;
-      const pctComb = parsed.precio > 0 ? (costoViaje / parsed.precio) * 100 : 0;
-      const res2 = await fetch("/api/analyze", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({
-          model:"claude-sonnet-4-20250514", max_tokens:200,
-          messages:[{ role:"user", content:`Experto Uber Argentina. SOLO JSON sin markdown.
-VIAJE: $${parsed.precio} | ${parsed.distanciaKm}km | ${parsed.tiempoMin}min | ORIGEN:${parsed.origen} DESTINO:${parsed.destino}
-METRICAS: neto:$${Math.round(neto)} nafta:$${Math.round(costoViaje)}(${Math.round(pctComb)}%) ${Math.round(xKm)}/km ${Math.round(xMin)}/min
-META:$12000-$18000/hora =>>=180/min neto. verde>=180 | amarillo 130-180 | rojo<130
-{"semaforo":"verde","razon":"frase max 8 palabras","consejo":"consejo max 10 palabras"}` }]
-        })
+      const pctComb = parsed.precio > 0 ? (parsed.costoNafta / parsed.precio) * 100 : 0;
+      setResultado({
+        semaforo: parsed.semaforo || "rojo",
+        precio: parsed.precio, distanciaKm: parsed.distanciaKm, tiempoMin: parsed.tiempoMin,
+        origen: parsed.origen, destino: parsed.destino,
+        neto: parsed.neto, costoViaje: parsed.costoNafta,
+        xKm, xMin: parsed.arsPorMin, pctComb
       });
-      const data2 = await res2.json();
-      const raw2 = data2.content?.map(b=>b.text||"").join("") || "";
-      const analisis = JSON.parse(raw2.replace(/```json|```/g,"").trim());
-      setResultado({ semaforo:analisis.semaforo||"rojo", razon:analisis.razon||"", consejo:analisis.consejo||"",
-        precio:parsed.precio, distanciaKm:parsed.distanciaKm, tiempoMin:parsed.tiempoMin,
-        origen:parsed.origen, destino:parsed.destino, neto, costoViaje, xKm, xMin, pctComb });
     } catch(e) { setError("Error al analizar. Intentá de nuevo."); }
     finally { setLoading(false); }
   };
@@ -124,10 +115,9 @@ META:$12000-$18000/hora =>>=180/min neto. verde>=180 | amarillo 130-180 | rojo<1
       )}
 
       {loading && (
-        <div style={{textAlign:"center",padding:"40px 0",animation:"fadeUp .3s ease"}}>
-          {preview && <img src={preview} alt="preview" style={{width:"100%",maxHeight:200,objectFit:"cover",borderRadius:10,marginBottom:20,opacity:0.5}} />}
-          <div style={{fontSize:40,animation:"pulse 1s infinite"}}>🔍</div>
-          <div style={{fontSize:11,color:"#555",letterSpacing:3,marginTop:12}}>ANALIZANDO CON IA...</div>
+        <div style={{textAlign:"center",padding:"60px 0",animation:"fadeUp .3s ease"}}>
+          <div style={{fontSize:72,animation:"pulse .8s infinite"}}>🔍</div>
+          <div style={{fontSize:11,color:"#555",letterSpacing:3,marginTop:16}}>ANALIZANDO...</div>
         </div>
       )}
 
@@ -136,16 +126,15 @@ META:$12000-$18000/hora =>>=180/min neto. verde>=180 | amarillo 130-180 | rojo<1
           {preview && <img src={preview} alt="captura" style={{width:"100%",maxHeight:120,objectFit:"cover",borderRadius:8,marginBottom:14,opacity:0.6}} />}
           <div style={{border:`1px solid ${sem.border}`,borderRadius:12,background:sem.bg,padding:18,marginBottom:14}}>
             <div style={{textAlign:"center",marginBottom:14}}>
-              <div style={{fontSize:56,filter:`drop-shadow(${sem.glow})`,lineHeight:1,marginBottom:4}}>{sem.emoji}</div>
-              <div style={{fontSize:20,fontWeight:900,color:sem.color,letterSpacing:4,textShadow:sem.glow}}>{sem.label}</div>
-              {resultado.razon && <div style={{fontSize:12,color:"#999",marginTop:5,fontStyle:"italic"}}>{resultado.razon}</div>}
+              <div style={{fontSize:72,filter:`drop-shadow(${sem.glow})`,lineHeight:1,marginBottom:6}}>{sem.emoji}</div>
+              <div style={{fontSize:24,fontWeight:900,color:sem.color,letterSpacing:4,textShadow:sem.glow}}>{sem.label}</div>
             </div>
             <div style={{background:"#0a0a14",borderRadius:8,padding:"10px 12px",marginBottom:12,fontSize:11,color:"#666"}}>
               <div>💰 ${fmt(resultado.precio)} ARS · {resultado.distanciaKm}km · {resultado.tiempoMin}min</div>
               <div style={{marginTop:4}}>📍 {resultado.origen}</div>
               <div>🏁 {resultado.destino}</div>
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
               {[
                 {label:"Ganancia neta",value:`$${fmt(resultado.neto)}`,color:resultado.neto>0?"#00ff88":"#ff3b5c"},
                 {label:"Costo nafta",value:`$${fmt(resultado.costoViaje)}`,color:"#ffd600"},
@@ -158,7 +147,6 @@ META:$12000-$18000/hora =>>=180/min neto. verde>=180 | amarillo 130-180 | rojo<1
                 </div>
               ))}
             </div>
-            {resultado.consejo && <div style={{background:"#080808",borderRadius:6,padding:"9px 12px",fontSize:11,color:"#666",display:"flex",gap:8}}><span>💡</span><span>{resultado.consejo}</span></div>}
           </div>
           <input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={handleFileChange} style={{display:"none"}} />
           <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10}}>
