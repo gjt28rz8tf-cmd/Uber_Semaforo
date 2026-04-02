@@ -45,7 +45,7 @@ function App() {
     });
     const mediaType = file.type || "image/jpeg";
     try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
+      const res = await fetch("/api/analyze", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
           model:"claude-sonnet-4-20250514", max_tokens:500,
@@ -70,7 +70,7 @@ Si no hay oferta visible: {"encontrado":false}` }
       const xKm = parsed.distanciaKm > 0 ? parsed.precio / parsed.distanciaKm : 0;
       const xMin = parsed.tiempoMin > 0 ? neto / parsed.tiempoMin : 0;
       const pctComb = parsed.precio > 0 ? (costoViaje / parsed.precio) * 100 : 0;
-      const res2 = await fetch("https://api.anthropic.com/v1/messages", {
+      const res2 = await fetch("/api/analyze", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
           model:"claude-sonnet-4-20250514", max_tokens:200,
