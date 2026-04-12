@@ -16,6 +16,31 @@ const CONSUMO_L100KM = 9.5;
 const COMISION_UBER = 0.25;
 const UMBRAL_VERDE = 180;
 const UMBRAL_AMARILLO = 130;
+const META_SEMANAL = 200000;
+
+const STORAGE_KEY = "uber_semaforo_semana";
+
+function getSemanaActual() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const startOfYear = new Date(year, 0, 1);
+  const week = Math.ceil(((now - startOfYear) / 86400000 + startOfYear.getDay() + 1) / 7);
+  return `${year}-W${week}`;
+}
+
+function loadTracker() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { semana: getSemanaActual(), acumulado: 0, viajes: 0 };
+    const data = JSON.parse(raw);
+    if (data.semana !== getSemanaActual()) return { semana: getSemanaActual(), acumulado: 0, viajes: 0 };
+    return data;
+  } catch { return { semana: getSemanaActual(), acumulado: 0, viajes: 0 }; }
+}
+
+function saveTracker(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
+}
 
 const SEM = {
   verde:    { color:"#00ff88", glow:"0 0 30px #00ff8866", label:"ACEPTAR",  emoji:"🟢", bg:"rgba(0,255,136,0.08)", border:"rgba(0,255,136,0.4)" },
@@ -25,16 +50,39 @@ const SEM = {
 
 const fmt = (n) => Math.round(n).toLocaleString("es-AR");
 
+function BarraMeta({ acumulado, meta }) {
+  const pct = Math.min((acumulado / meta) * 100, 100);
+  const falta = Math.max(meta - acumulado, 0);
+  const color = pct >= 100 ? "#00ff88" : pct >= 60 ? "#ffd600" : "#6666ee";
+  return (
+    <div style={{background:"#0a0a14",borderRadius:10,padding:"12px 14px",marginBottom:16}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}}>
+        <span style={{fontSize:9,color:"#555",letterSpacing:2}}>META SEMANAL</span>
+        <span style={{fontSize:9,color:"#555"}}>${fmt(acumulado)} / ${fmt(meta)}</span>
+      </div>
+      <div style={{background:"#15151f",borderRadius:4,height:6,marginBottom:8}}>
+        <div style={{width:`${pct}%`,height:"100%",borderRadius:4,background:color,transition:"width .4s ease",boxShadow:`0 0 8px ${color}88`}} />
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between"}}>
+        <span style={{fontSize:11,color:color,fontWeight:700}}>{pct >= 100 ? "🏆 META CUMPLIDA" : `Falta $${fmt(falta)}`}</span>
+        <span style={{fontSize:10,color:"#444"}}>{pct.toFixed(0)}%</span>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [resultado, setResultado] = React.useState(null);
   const [loading, setLoading] = React.useState(false);
   const [preview, setPreview] = React.useState(null);
   const [error, setError] = React.useState(null);
+  const [tracker, setTracker] = React.useState(() => loadTracker());
+  const [viajeContado, setViajeContado] = React.useState(false);
   const cameraRef = React.useRef(null);
 
   const processImage = async (file) => {
     if (!file) return;
-    setLoading(true); setResultado(null); setError(null);
+    setLoading(true); setResultado(null); setError(null); setViajeContado(false);
     const reader = new FileReader();
     reader.onload = (e) => setPreview(e.target.result);
     reader.readAsDataURL(file);
@@ -49,19 +97,25 @@ function App() {
       const res = await fetch("/api/analyze", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
-          model:"claude-haiku-4-5-20251001", max_tokens:300,
+          model:"claude-haiku-4-5-20251001", max_tokens:350,
           messages:[{ role:"user", content:[
             { type:"image", source:{ type:"base64", media_type:mediaType, data:base64 }},
             { type:"text", text:`Analizá esta captura de Uber Driver Argentina.
-Extraé: precio ARS (número grande), distanciaKm, tiempoMin, origen, destino.
+Extraé los siguientes datos:
+- precioBase ARS: el número más grande (el precio principal del viaje)
+- adicionales ARS: cualquier monto extra que aparezca ARRIBA del precio principal (puede ser +$XXX por zona, exclusive, demanda alta, bonificación, etc.). Si hay varios, sumalos. Si no hay ninguno, es 0.
+- precio = precioBase + adicionales (precio total real)
+- distanciaKm, tiempoMin, origen (barrio), destino (barrio)
+
 Calculá internamente:
 - costoNafta = distanciaKm * ${costoKm.toFixed(2)}
 - neto = precio * ${(1 - COMISION_UBER).toFixed(2)} - costoNafta
 - arsPorMin = neto / tiempoMin
 - semaforo: "verde" si arsPorMin >= ${UMBRAL_VERDE}, "amarillo" si >= ${UMBRAL_AMARILLO}, sino "rojo"
+
 Respondé SOLO JSON sin markdown:
-{"encontrado":true,"precio":4262,"distanciaKm":5.8,"tiempoMin":19,"origen":"barrio","destino":"barrio","neto":2800,"costoNafta":1270,"arsPorMin":147,"semaforo":"amarillo"}
-Si no hay oferta: {"encontrado":false}` }
+{"encontrado":true,"precioBase":7500,"adicionales":700,"precio":8200,"distanciaKm":8.2,"tiempoMin":19,"origen":"Once","destino":"Colegiales","neto":5870,"costoNafta":1598,"arsPorMin":309,"semaforo":"verde"}
+Si no hay oferta visible: {"encontrado":false}` }
           ]}]
         })
       });
@@ -70,46 +124,88 @@ Si no hay oferta: {"encontrado":false}` }
       const parsed = JSON.parse(raw.replace(/```json|```/g,"").trim());
       if (!parsed.encontrado) { setError("No se detectó ninguna oferta de viaje."); setLoading(false); return; }
       const xKm = parsed.distanciaKm > 0 ? parsed.precio / parsed.distanciaKm : 0;
-      const pctComb = parsed.precio > 0 ? (parsed.costoNafta / parsed.precio) * 100 : 0;
       setResultado({
         semaforo: parsed.semaforo || "rojo",
-        precio: parsed.precio, distanciaKm: parsed.distanciaKm, tiempoMin: parsed.tiempoMin,
-        origen: parsed.origen, destino: parsed.destino,
-        neto: parsed.neto, costoViaje: parsed.costoNafta,
-        xKm, xMin: parsed.arsPorMin, pctComb
+        precio: parsed.precio,
+        precioBase: parsed.precioBase,
+        adicionales: parsed.adicionales || 0,
+        distanciaKm: parsed.distanciaKm,
+        tiempoMin: parsed.tiempoMin,
+        origen: parsed.origen,
+        destino: parsed.destino,
+        neto: parsed.neto,
+        costoViaje: parsed.costoNafta,
+        xKm,
+        xMin: parsed.arsPorMin,
       });
     } catch(e) { setError("Error al analizar. Intentá de nuevo."); }
     finally { setLoading(false); }
   };
 
+  const contarViaje = () => {
+    if (!resultado || viajeContado) return;
+    const nuevo = {
+      semana: tracker.semana,
+      acumulado: tracker.acumulado + resultado.neto,
+      viajes: tracker.viajes + 1,
+    };
+    saveTracker(nuevo);
+    setTracker(nuevo);
+    setViajeContado(true);
+  };
+
+  const resetTracker = () => {
+    const nuevo = { semana: getSemanaActual(), acumulado: 0, viajes: 0 };
+    saveTracker(nuevo);
+    setTracker(nuevo);
+  };
+
   const handleFileChange = (e) => { const f=e.target.files?.[0]; if(f) processImage(f); e.target.value=""; };
-  const limpiar = () => { setResultado(null); setPreview(null); setError(null); };
+  const limpiar = () => { setResultado(null); setPreview(null); setError(null); setViajeContado(false); };
   const sem = resultado ? SEM[resultado.semaforo] : null;
 
   return (
     <div style={{minHeight:"100vh",background:"#080810",fontFamily:"'Courier New',monospace",color:"#ddd",padding:"20px 16px 50px",maxWidth:420,margin:"0 auto"}}>
       <style>{`@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}@keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}`}</style>
-      <div style={{textAlign:"center",marginBottom:28}}>
+
+      <div style={{textAlign:"center",marginBottom:20}}>
         <div style={{fontSize:10,letterSpacing:5,color:"#333",marginBottom:4}}>PEUGEOT 2008 · CABA/GBA</div>
         <div style={{fontSize:26,fontWeight:900,letterSpacing:-1,background:"linear-gradient(120deg,#fff 40%,#555)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>SEMÁFORO UBER</div>
         <div style={{fontSize:10,color:"#333",letterSpacing:2,marginTop:3}}>FOTO → IA → SEMÁFORO</div>
       </div>
 
+      <BarraMeta acumulado={tracker.acumulado} meta={META_SEMANAL} />
+
       {!loading && !resultado && (
         <div style={{animation:"fadeUp .3s ease"}}>
           <input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={handleFileChange} style={{display:"none"}} />
-          <button onClick={()=>cameraRef.current?.click()} style={{width:"100%",height:180,background:"linear-gradient(135deg,#0a0a20,#050510)",border:"2px dashed #2a2a5e",borderRadius:16,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12}}>
+          <button onClick={()=>cameraRef.current?.click()} style={{width:"100%",height:160,background:"linear-gradient(135deg,#0a0a20,#050510)",border:"2px dashed #2a2a5e",borderRadius:16,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:12}}>
             <div style={{fontSize:56}}>📸</div>
             <div style={{fontSize:14,color:"#6666ee",fontWeight:700,letterSpacing:2}}>FOTOGRAFIAR VIAJE</div>
             <div style={{fontSize:10,color:"#444"}}>Apuntá al celular con Uber abierto</div>
           </button>
           {error && <div style={{marginTop:16,background:"rgba(255,59,92,.1)",border:"1px solid rgba(255,59,92,.3)",borderRadius:8,padding:"12px 14px",fontSize:12,color:"#ff8fa0",textAlign:"center"}}>{error}</div>}
-          <div style={{marginTop:20,background:"#0a0a14",borderRadius:10,padding:14,fontSize:11,color:"#444"}}>
+
+          <div style={{marginTop:12,display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            <div style={{background:"#0a0a14",borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+              <div style={{fontSize:9,color:"#444",marginBottom:3}}>VIAJES SEMANA</div>
+              <div style={{fontSize:20,fontWeight:700,color:"#6666ee"}}>{tracker.viajes}</div>
+            </div>
+            <div style={{background:"#0a0a14",borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+              <div style={{fontSize:9,color:"#444",marginBottom:3}}>NETO ACUMULADO</div>
+              <div style={{fontSize:14,fontWeight:700,color:"#00ff88"}}>${fmt(tracker.acumulado)}</div>
+            </div>
+          </div>
+
+          <button onClick={resetTracker} style={{marginTop:10,width:"100%",background:"none",border:"1px solid #1a1a2e",color:"#2a2a4e",fontSize:9,letterSpacing:2,padding:"8px 0",borderRadius:6,cursor:"pointer",fontFamily:"inherit"}}>RESETEAR SEMANA</button>
+
+          <div style={{marginTop:16,background:"#0a0a14",borderRadius:10,padding:14,fontSize:11,color:"#444"}}>
             <div style={{marginBottom:6,color:"#555",letterSpacing:1,fontSize:9}}>CÓMO USAR</div>
             <div>1. Esperá que llegue el viaje en Uber</div>
             <div>2. Tocá el botón y fotografiá la pantalla</div>
             <div>3. La IA lee los datos en segundos</div>
             <div>4. El semáforo te dice si aceptar o no</div>
+            <div>5. Si aceptás, tocá SUMAR AL ACUMULADO</div>
           </div>
         </div>
       )}
@@ -123,18 +219,31 @@ Si no hay oferta: {"encontrado":false}` }
 
       {resultado && sem && (
         <div style={{animation:"fadeUp .35s ease"}}>
-          {preview && <img src={preview} alt="captura" style={{width:"100%",maxHeight:120,objectFit:"cover",borderRadius:8,marginBottom:14,opacity:0.6}} />}
+          {preview && <img src={preview} alt="captura" style={{width:"100%",maxHeight:100,objectFit:"cover",borderRadius:8,marginBottom:14,opacity:0.5}} />}
           <div style={{border:`1px solid ${sem.border}`,borderRadius:12,background:sem.bg,padding:18,marginBottom:14}}>
             <div style={{textAlign:"center",marginBottom:14}}>
               <div style={{fontSize:72,filter:`drop-shadow(${sem.glow})`,lineHeight:1,marginBottom:6}}>{sem.emoji}</div>
               <div style={{fontSize:24,fontWeight:900,color:sem.color,letterSpacing:4,textShadow:sem.glow}}>{sem.label}</div>
             </div>
+
             <div style={{background:"#0a0a14",borderRadius:8,padding:"10px 12px",marginBottom:12,fontSize:11,color:"#666"}}>
-              <div>💰 ${fmt(resultado.precio)} ARS · {resultado.distanciaKm}km · {resultado.tiempoMin}min</div>
-              <div style={{marginTop:4}}>📍 {resultado.origen}</div>
-              <div>🏁 {resultado.destino}</div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span>💰 Precio total</span>
+                <span style={{color:"#ddd",fontWeight:700,fontSize:13}}>${fmt(resultado.precio)}</span>
+              </div>
+              {resultado.adicionales > 0 && (
+                <div style={{display:"flex",justifyContent:"space-between",marginTop:3}}>
+                  <span style={{color:"#555"}}>  └ base ${fmt(resultado.precioBase)} + adicional</span>
+                  <span style={{color:"#ffd600",fontSize:11}}>+${fmt(resultado.adicionales)}</span>
+                </div>
+              )}
+              <div style={{marginTop:6,borderTop:"1px solid #15151f",paddingTop:6}}>
+                <div>{resultado.distanciaKm} km · {resultado.tiempoMin} min</div>
+                <div style={{marginTop:3}}>📍 {resultado.origen} → 🏁 {resultado.destino}</div>
+              </div>
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
               {[
                 {label:"Ganancia neta",value:`$${fmt(resultado.neto)}`,color:resultado.neto>0?"#00ff88":"#ff3b5c"},
                 {label:"Costo nafta",value:`$${fmt(resultado.costoViaje)}`,color:"#ffd600"},
@@ -147,7 +256,18 @@ Si no hay oferta: {"encontrado":false}` }
                 </div>
               ))}
             </div>
+
+            {!viajeContado ? (
+              <button onClick={contarViaje} style={{width:"100%",background:"rgba(0,255,136,0.1)",border:"1px solid rgba(0,255,136,0.3)",color:"#00ff88",fontSize:12,fontWeight:700,letterSpacing:2,padding:"12px 0",borderRadius:8,cursor:"pointer",fontFamily:"inherit"}}>
+                ✅ ACEPTÉ — SUMAR ${fmt(resultado.neto)}
+              </button>
+            ) : (
+              <div style={{textAlign:"center",fontSize:11,color:"#00ff88",padding:"10px 0",border:"1px solid rgba(0,255,136,0.2)",borderRadius:8,background:"rgba(0,255,136,0.05)"}}>
+                ✓ Sumado · Acumulado semana: ${fmt(tracker.acumulado)}
+              </div>
+            )}
           </div>
+
           <input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={handleFileChange} style={{display:"none"}} />
           <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10}}>
             <button onClick={()=>cameraRef.current?.click()} style={{background:"linear-gradient(135deg,#10102a,#080818)",border:"1px solid #22224e",color:"#6666ee",fontSize:13,fontWeight:700,letterSpacing:2,padding:"14px 0",borderRadius:8,cursor:"pointer",fontFamily:"inherit"}}>📸 NUEVA FOTO</button>
